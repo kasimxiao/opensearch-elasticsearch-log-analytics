@@ -53,3 +53,4 @@ log_analytics/
 - 简化会话管理，添加SessionManager类
 - 修复所有图表类型的渲染问题
 - 添加完整的错误处理和数据验证
+# opensearch-elasticsearch-log-analytics
