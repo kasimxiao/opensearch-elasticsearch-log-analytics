@@ -329,28 +329,37 @@ class QueryDisplay:
             return False
     
     def add_output(self, data_type: str, content: Any, title: str = None, status: str = "processing"):
-        """添加输出项"""
+        """添加输出项 - 确保相同标题只显示一次"""
         try:
+            title = title or f"{data_type.upper()} 输出"
+            
+            # 查找现有的相同标题输出项
+            existing_idx = None
+            existing_id = None
+            for i, output in enumerate(self.outputs):
+                if output.get("title") == title:
+                    existing_idx = i
+                    existing_id = output.get("id")
+                    break
+            
+            # 创建或更新输出项
             output_item = {
-                "id": str(uuid.uuid4()),
+                "id": existing_id or str(uuid.uuid4()),  # 保持相同ID或创建新ID
                 "data_type": data_type,
                 "content": content,
-                "title": title or f"{data_type.upper()} 输出",
+                "title": title,
                 "status": status,
                 "timestamp": datetime.now()
             }
             
-            # 更新或添加输出项
-            existing_idx = None
-            for i, output in enumerate(self.outputs):
-                if output.get("title") == title:
-                    existing_idx = i
-                    break
-            
             if existing_idx is not None:
+                # 更新现有项
                 self.outputs[existing_idx] = output_item
+                logger.info(f"更新输出项: {title} -> {status}")
             else:
+                # 添加新项
                 self.outputs.append(output_item)
+                logger.info(f"添加新输出项: {title} -> {status}")
             
             self._render_output(output_item)
             
@@ -358,17 +367,18 @@ class QueryDisplay:
             logger.error(f"添加输出项失败: {str(e)}")
     
     def _render_output(self, output_item: Dict[str, Any]):
-        """渲染输出项"""
+        """渲染输出项 - 使用标题作为容器键确保唯一性"""
         try:
             if not self.output_container:
                 return
             
-            output_id = output_item["id"]
-            if output_id not in self.output_containers:
+            # 使用标题作为容器键，确保相同标题使用相同容器
+            container_key = output_item["title"]
+            if container_key not in self.output_containers:
                 with self.output_container:
-                    self.output_containers[output_id] = st.empty()
+                    self.output_containers[container_key] = st.empty()
             
-            container = self.output_containers[output_id]
+            container = self.output_containers[container_key]
             
             with container.container():
                 # 状态显示
@@ -486,42 +496,104 @@ class RealTimeCallback:
                 # 添加时间戳确保更新顺序
                 update_timestamp = datetime.now()
                 
-                # 将更新添加到队列
-                update_info = {
-                    "data_type": data_type,
-                    "content": content,
-                    "title": title,
-                    "status": status,
-                    "thread_name": thread_name,
-                    "timestamp": update_timestamp,
-                    "update_id": str(uuid.uuid4())
-                }
-                self.updates.append(update_info)
+                # 简化的线程处理逻辑 - 只关注线程安全
+                can_render = self._can_safely_render(current_thread, thread_name)
                 
-                # 按时间戳排序，确保显示顺序正确
-                self.updates.sort(key=lambda x: x["timestamp"])
-                
-                # 简化线程处理逻辑 - 只在主线程或ScriptRunner线程中直接渲染
-                if "MainThread" in thread_name or "ScriptRunner" in thread_name:
+                if can_render:
                     try:
+                        # 直接调用add_output，它会处理重复和更新逻辑
                         self.display.add_output(data_type, content, title, status)
-                        logger.info(f"在{thread_name}中成功渲染输出: {title}")
+                        logger.info(f"在{thread_name}中渲染输出: {title} -> {status}")
                     except Exception as e:
                         logger.error(f"输出项处理失败 (线程: {thread_name}): {str(e)}")
-                        # 不抛出异常，继续处理
                 else:
-                    # 在其他线程中，只记录日志，不尝试渲染
-                    logger.info(f"输出项在{thread_name}中添加，跳过渲染: {title}")
+                    # 在非安全线程中，记录到队列等待后续处理
+                    update_info = {
+                        "data_type": data_type,
+                        "content": content,
+                        "title": title,
+                        "status": status,
+                        "thread_name": thread_name,
+                        "timestamp": update_timestamp
+                    }
+                    self.updates.append(update_info)
+                    logger.info(f"输出项在{thread_name}中排队等待渲染: {title}")
                 
         except Exception as e:
             logger.error(f"处理回调失败: {str(e)}")
             # 不抛出异常，避免中断整个处理流程
     
+
+
+    def _can_safely_render(self, current_thread, thread_name):
+        """
+        判断是否可以安全渲染UI组件
+        使用多种方法来判断，提高跨平台兼容性
+        """
+        import threading
+        
+        # 方法1: 检查是否是主线程
+        if current_thread is threading.main_thread():
+            return True
+        
+        # 方法2: 检查线程名称（兼容不同环境）
+        safe_thread_patterns = [
+            "MainThread",      # 标准主线程名称
+            "ScriptRunner",    # Streamlit脚本运行线程
+            "main",            # 某些环境下的主线程名称
+            "Thread-1",        # 某些环境下的主线程名称
+            "MainProcess"      # 多进程环境下的主进程
+        ]
+        
+        for pattern in safe_thread_patterns:
+            if pattern.lower() in thread_name.lower():
+                return True
+        
+        # 方法3: 检查线程ID（主线程通常ID较小）
+        try:
+            if hasattr(current_thread, 'ident') and current_thread.ident:
+                # 主线程通常有较小的ID
+                if current_thread.ident <= 10:  # 经验值
+                    return True
+        except:
+            pass
+        
+        # 方法4: 尝试检查是否在Streamlit上下文中
+        try:
+            import streamlit as st
+            # 如果能访问session_state，通常表示在主线程中
+            _ = st.session_state
+            return True
+        except:
+            pass
+        
+        # 默认情况下不渲染，避免线程安全问题
+        return False
+
     def process_updates(self):
         """处理所有累积的更新"""
-        updates = self.updates.copy()
+        import threading
+        current_thread = threading.current_thread()
+        thread_name = current_thread.name
+        
+        # 在主线程中处理排队的更新
+        if self._can_safely_render(current_thread, thread_name):
+            for update in self.updates:
+                try:
+                    self.display.add_output(
+                        update["data_type"], 
+                        update["content"], 
+                        update["title"], 
+                        update["status"]
+                    )
+                    logger.info(f"处理排队更新: {update['title']} -> {update['status']}")
+                except Exception as e:
+                    logger.error(f"处理排队更新失败: {str(e)}")
+        
+        # 清空队列
+        processed_updates = self.updates.copy()
         self.updates = []
-        return updates
+        return processed_updates
 
 
 def render_chart_data(chart_data):
